@@ -13,17 +13,15 @@ For offline development:
 
     LLM_PROVIDER=rule-based EMBEDDING_PROVIDER=hashing docker compose up -d --build
 
-For the real provider path, configure `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` in the ignored `.env` file, then recreate the service.
+For real providers, configure `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` in the ignored `.env` file, then recreate the service.
 
-## Architecture
+## Knowledge base
 
-The pipeline embeds the ticket, runs pgvector cosine search and PostgreSQL full-text search, merges results with Reciprocal Rank Fusion, calls Claude Sonnet, validates citations, computes confidence, and persists the run.
-
-PostgreSQL + pgvector stores `kb_documents`, `kb_chunks`, `triage_runs`, and `feedback`. The vector column is `vector(1536)` and uses an HNSW index; lexical search uses `tsvector` with a GIN index.
-
-Ingest the knowledge base as a separate job:
+`app/ingest.py` chunks Markdown runbooks, generates embeddings, and populates `kb_documents` and `kb_chunks` as a separate job:
 
     docker compose exec service-b python -m app.ingest kb
+
+The production embedding column is `vector(1536)` with an HNSW index. PostgreSQL full-text search uses a generated `tsvector` column and GIN index. The retrieval flow is vector search + keyword search + Reciprocal Rank Fusion, returning the top five chunks.
 
 ## API
 
@@ -33,6 +31,20 @@ Ingest the knowledge base as a separate job:
 - `GET /readyz`
 - `GET /metrics`
 
+## Pipeline
+
+1. Check `request_id` idempotency.
+2. Check duplicate `input_hash`.
+3. Embed the ticket.
+4. Run pgvector cosine search and PostgreSQL full-text search.
+5. Fuse ranked results with Reciprocal Rank Fusion.
+6. Classify with Claude Sonnet or the offline rule-based model.
+7. Validate retrieved citations.
+8. Compute confidence.
+9. Persist the result in `triage_runs`.
+
+Unsupported tickets use the refusal path with `category: other`, no suggested reply, and clarifying questions.
+
 ## Tests and evaluation
 
     ruff check .
@@ -41,6 +53,14 @@ Ingest the knowledge base as a separate job:
 
 The evaluation reports Recall@5, Precision@5, MRR, NDCG@5, category/priority/refusal accuracy, citation metrics, grounded-response rate, latency, and confidence.
 
+## Metrics
+
+Prometheus metrics are exposed at `/metrics`, including request outcomes, latency, confidence, refusals, overloads, cache hits, retrieval size, in-flight requests, LLM tokens, and estimated cost.
+
+## Database
+
+PostgreSQL with pgvector stores `kb_documents`, `kb_chunks`, `triage_runs`, and `feedback`. Alembic migrations are in `alembic/`; the current vector-dimension migration is `8d1c4d2a9f31`.
+
 ## CI/CD
 
-GitHub Actions runs lint, tests, RAG evaluation, Docker build, and the AWS deployment workflow. The deployment path pushes an immutable commit-tagged image to ECR and deploys it to ECS/Fargate using OIDC and Secrets Manager. See `deploy/ecs-task-definition.json` and `.github/workflows/ci.yml` for required AWS/GitHub configuration.
+GitHub Actions runs lint, tests, RAG evaluation, Docker build, and AWS deployment. The deployment path pushes an immutable commit-tagged image to ECR and deploys it to ECS/Fargate using OIDC and Secrets Manager. See `deploy/ecs-task-definition.json` and `.github/workflows/ci.yml` for required configuration.
