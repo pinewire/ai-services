@@ -1,7 +1,9 @@
-# Service B — triage stub
+# Service B — triage engine
 
-Week 3 deliverable. Contract-shaped responses, no AI code, so Service A can
-build the whole intake path before the pipeline exists.
+Classifies helpdesk tickets and drafts grounded replies via hybrid retrieval
+(pgvector + Postgres full-text search) over ingested runbooks. Stateless with
+respect to tickets: it answers "what do you make of this?" and never stores,
+mutates, or replies on behalf of anyone.
 
 ## Run it
 
@@ -16,6 +18,19 @@ Or without Docker:
     pip install -r requirements-dev.txt
     export DATABASE_URL=postgresql+asyncpg://b_user:b_pass@localhost:5433/service_b
     uvicorn app.main:app --reload
+
+## Ingest the knowledge base
+
+The triage pipeline can't ground a reply in anything until the KB has
+content. `kb/*.md` are sample runbooks; ingestion chunks them by heading,
+embeds each chunk, and populates `kb_documents` / `kb_chunks`:
+
+    docker exec <service-b container> python -m app.ingest kb
+    # or, without Docker:
+    python -m app.ingest kb
+
+This runs as a one-off job, not inside the API process — see "Hosting"
+below. `tests/conftest.py` re-runs it automatically before the test suite.
 
 ## Tests
 
@@ -64,22 +79,70 @@ outbox worker without anyone killing a container by hand.
 Both belong in A's integration tests. Remove them before this is ever
 reachable from anything but a dev environment.
 
-## What is fake and what is not
+A third mechanism sheds load under real concurrency pressure: once
+`MAX_INFLIGHT_TRIAGE` (default 8) requests are in flight, new ones get the
+same 503 + `Retry-After: 30` without touching the pipeline.
 
-Fake: keyword rules instead of retrieval, no embeddings, no model call,
-`token_cost_usd` always 0.
+## The pipeline
 
-Real: the request and response schemas, the 422 on invalid input, the 503
-shape, the refusal path (`category: other`, no citations, clarifying
-questions returned). When the pipeline lands behind this, Service A does
-not change.
+1. **Idempotency check** — `request_id` is unique in `triage_runs`; a repeat
+   call (A's sync attempt and its outbox worker can both fire) returns the
+   cached run instead of re-running inference.
+2. **Embed** the ticket subject + message bodies (`app/embeddings.py`).
+3. **Vector search** `kb_chunks` via pgvector cosine similarity.
+4. **Keyword search** the same chunks via Postgres full-text search — this
+   is what catches exact strings like `VPN-4021` that embeddings alone treat
+   as near-noise.
+5. **Fuse** both result sets with reciprocal rank fusion, take the top 5
+   (`app/retrieval.py`).
+6. **Classify** against a forced JSON schema (`app/llm.py`); a Pydantic
+   validation failure triggers one reject-and-retry.
+7. **Resolve citations** against the retrieved set only — a chunk ID the
+   model never saw is confabulation even if it exists in the KB.
+8. **Compose confidence** from measurable signals (top similarity, margin,
+   citation survival, vector/keyword agreement), never self-reported
+   (`app/confidence.py`). Capped hard at 0.3 if no citation survives.
+9. **Persist and respond** (`app/pipeline.py`).
+
+**Refusal is a first-class outcome.** When retrieval finds nothing above the
+relevance threshold, the response is `category: "other"`, `confidence: 0.3`,
+`suggested_reply: null`, and clarifying questions — never an invented fix.
+
+The default embedding/model implementations (`HashingEmbeddingClient`,
+`RuleBasedTriageModel`) are zero-dependency stand-ins: deterministic feature
+hashing instead of a real embedding model, keyword rules instead of an LLM
+call. They keep local dev and CI free of API keys and model downloads while
+keeping the pipeline's shape (retrieval → forced JSON → citation resolution →
+composed confidence) identical to what a real model swap-in would use. Swap
+them via `get_embedding_client()` / `get_triage_model()`.
+
+## Feedback
+
+    POST /v1/feedback
+    { "request_id": "...", "verdict": "incorrect", "corrected_category": "network.vpn" }
+
+Links an agent correction to the `triage_runs` row for that `request_id`
+(404 if no run exists yet).
 
 ## Database
 
 `docker-compose.yml` runs Postgres (`pgvector/pgvector:pg16`) alongside the
-app. On startup the app creates a `triage_log` table and persists a row for
-every `/v1/triage` call (best-effort — a DB hiccup never fails the request).
-`/readyz` fails with 503 if Postgres is unreachable.
+app. On startup the app creates the `vector` extension and four tables:
+`kb_documents`, `kb_chunks` (embedding + full-text index), `triage_runs`
+(the idempotency log), and `feedback`. `/readyz` fails with 503 if Postgres
+is unreachable.
+
+This is a separate Postgres instance from Service A's, with separate
+credentials — same engine, different database, no cross-service joins.
+
+## Hosting notes
+
+B's hosting requirements are the inverse of A's: it's permitted to be down,
+so deploy it separately from A with its own scaling policy and deploy
+cadence — shipping a prompt change shouldn't redeploy the ticket API. No GPU
+needed (embeddings are CPU-sized or hosted-API; the expensive call is the
+LLM, which is someone else's infrastructure). KB ingestion (`app/ingest.py`)
+runs as a scheduled job, never inside the API process.
 
 ## CI/CD
 

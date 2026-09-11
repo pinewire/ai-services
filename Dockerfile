@@ -18,6 +18,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
+COPY kb ./kb
 
 
 # Run as a non-root user. If the process is compromised it should not own the

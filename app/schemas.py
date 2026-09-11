@@ -79,3 +79,19 @@ class ErrorResponse(BaseModel):
     error: str
     detail: str
     request_id: UUID | None = None
+
+
+# --------------------------------------------------------------- feedback
+
+
+class FeedbackRequest(BaseModel):
+    request_id: UUID
+    verdict: Literal["correct", "incorrect"]
+    corrected_category: str | None = None
+    corrected_priority: Priority | None = None
+
+
+class FeedbackResponse(BaseModel):
+    status: Literal["recorded"]
+    run_id: UUID
+

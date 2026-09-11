@@ -4,14 +4,13 @@ services:
     ports:
       - "8001:8000"   # host 8001: port 8000 is already used by another local process on this machine
     environment:
-      PROMPT_VERSION: stub-v0
+      PROMPT_VERSION: pipeline-v1
       DATABASE_URL: postgresql+asyncpg://b_user:b_pass@db:5432/service_b
     depends_on:
       db:
         condition: service_healthy
 
-  # Not used by the stub. Present so the real pipeline has somewhere to land:
-  # pgvector for dense retrieval, tsvector/GIN for the keyword side.
+  # Hybrid retrieval store: pgvector for dense search, tsvector/GIN for keyword.
   db:
     image: pgvector/pgvector:pg16
     environment:
