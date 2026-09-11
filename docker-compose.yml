@@ -1,0 +1,32 @@
+services:
+  service-b:
+    build: .
+    ports:
+      - "8001:8000"   # host 8001: port 8000 is already used by another local process on this machine
+    environment:
+      PROMPT_VERSION: stub-v0
+      DATABASE_URL: postgresql+asyncpg://b_user:b_pass@db:5432/service_b
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # Not used by the stub. Present so the real pipeline has somewhere to land:
+  # pgvector for dense retrieval, tsvector/GIN for the keyword side.
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: b_user
+      POSTGRES_PASSWORD: b_pass
+      POSTGRES_DB: service_b
+    ports:
+      - "5433:5432"   # 5433 on the host so it cannot collide with A's Postgres
+    volumes:
+      - b_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U b_user -d service_b"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  b_pgdata:
