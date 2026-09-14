@@ -1,4 +1,5 @@
 import asyncio
+import os
 from logging.config import fileConfig
 
 from sqlalchemy import pool
@@ -6,12 +7,12 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from alembic import context
+import app.models  # noqa: F401
+from app.db import Base
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
 config = context.config
-
-import os
 config.set_main_option(
     "sqlalchemy.url",
     os.getenv("DATABASE_URL", "postgresql+asyncpg://b_user:b_pass@localhost:5433/service_b"),
@@ -27,8 +28,6 @@ if config.config_file_name is not None:
 # for 'autogenerate' support
 # from myapp import mymodel
 # target_metadata = mymodel.Base.metadata
-from app.db import Base
-import app.models  # noqa: F401
 
 target_metadata = Base.metadata
 
