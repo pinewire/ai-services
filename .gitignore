@@ -6,3 +6,4 @@ venv/
 .mypy_cache/
 .env
 *.egg-info/
+evals/rag_eval_report.json

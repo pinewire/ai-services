@@ -1,0 +1,50 @@
+{
+  "family": "service-b",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::<AWS_ACCOUNT_ID>:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::<AWS_ACCOUNT_ID>:role/service-b-task-role",
+  "containerDefinitions": [
+    {
+      "name": "service-b",
+      "image": "service-b:placeholder",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8000,
+          "protocol": "tcp"
+        }
+      ],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)\""],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 10
+      },
+      "environment": [
+        {"name": "PROMPT_VERSION", "value": "pipeline-v1"},
+        {"name": "LLM_PROVIDER", "value": "anthropic"},
+        {"name": "ANTHROPIC_MODEL", "value": "claude-sonnet-4-6"},
+        {"name": "EMBEDDING_PROVIDER", "value": "openai"},
+        {"name": "OPENAI_EMBEDDING_MODEL", "value": "text-embedding-3-small"},
+        {"name": "TRIAGE_TIMEOUT_SECONDS", "value": "30"}
+      ],
+      "secrets": [
+        {"name": "DATABASE_URL", "valueFrom": "arn:aws:secretsmanager:<AWS_REGION>:<AWS_ACCOUNT_ID>:secret:service-b/database-url"},
+        {"name": "ANTHROPIC_API_KEY", "valueFrom": "arn:aws:secretsmanager:<AWS_REGION>:<AWS_ACCOUNT_ID>:secret:service-b/anthropic-api-key"},
+        {"name": "OPENAI_API_KEY", "valueFrom": "arn:aws:secretsmanager:<AWS_REGION>:<AWS_ACCOUNT_ID>:secret:service-b/openai-api-key"}
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/service-b",
+          "awslogs-region": "<AWS_REGION>",
+          "awslogs-stream-prefix": "ecs"
+        }
+      }
+    }
+  ]
+}

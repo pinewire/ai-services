@@ -1,4 +1,4 @@
-name: CI
+name: Service B CI/CD
 
 on:
   push:
@@ -43,29 +43,29 @@ jobs:
           DATABASE_URL: postgresql+asyncpg://b_user:b_pass@localhost:5432/service_b
         run: pytest -v
 
-  build:
+      - name: RAG evaluation
+        env:
+          DATABASE_URL: postgresql+asyncpg://b_user:b_pass@localhost:5432/service_b
+          EMBEDDING_PROVIDER: hashing
+          LLM_PROVIDER: rule-based
+        run: python -m app.evaluation evals/rag_eval.json
+
+      - name: Upload RAG evaluation report
+        uses: actions/upload-artifact@v4
+        with:
+          name: rag-evaluation-report
+          path: evals/rag_eval_report.json
+
+  build-and-push:
     needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Build image
-        run: docker build -t service-b:${{ github.sha }} .
-
-  deploy:
-    needs: build
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    runs-on: ubuntu-latest
-    permissions:
-      id-token: write   # required for AWS OIDC — no long-lived secrets in the repo
-      contents: read
+      id-token: write
     env:
-      AWS_REGION: us-east-1
-      ECR_REPOSITORY: service-b
-      ECS_CLUSTER: service-b-cluster
-      ECS_SERVICE: service-b
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY || 'service-b' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -79,17 +79,35 @@ jobs:
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build, tag, and push image
+      - name: Build and push immutable image
         env:
           REGISTRY: ${{ steps.ecr-login.outputs.registry }}
         run: |
-          docker build -t "$REGISTRY/$ECR_REPOSITORY:${{ github.sha }}" -t "$REGISTRY/$ECR_REPOSITORY:latest" .
+          docker build \
+            --label org.opencontainers.image.revision=${{ github.sha }} \
+            --label org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }} \
+            -t "$REGISTRY/$ECR_REPOSITORY:${{ github.sha }}" .
           docker push "$REGISTRY/$ECR_REPOSITORY:${{ github.sha }}"
-          docker push "$REGISTRY/$ECR_REPOSITORY:latest"
 
-      - name: Deploy new image to ECS
+      - name: Prepare ECS task definition
+        env:
+          AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
         run: |
-          aws ecs update-service \
-            --cluster "$ECS_CLUSTER" \
-            --service "$ECS_SERVICE" \
-            --force-new-deployment
+          test -n "$AWS_ACCOUNT_ID"
+          sed -i "s/<AWS_ACCOUNT_ID>/$AWS_ACCOUNT_ID/g; s/<AWS_REGION>/${AWS_REGION}/g" deploy/ecs-task-definition.json
+
+      - name: Render ECS task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: deploy/ecs-task-definition.json
+          container-name: service-b
+          image: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ vars.ECS_SERVICE || 'service-b' }}
+          cluster: ${{ vars.ECS_CLUSTER || 'service-b-cluster' }}
+          wait-for-service-stability: true

@@ -39,6 +39,42 @@ below. `tests/conftest.py` re-runs it automatically before the test suite.
     DATABASE_URL=postgresql+asyncpg://b_user:b_pass@localhost:5433/service_b pytest -v
     ruff check .
 
+## Use a real LLM
+
+The default provider is the offline rule-based model. To use Claude Sonnet,
+provide the Anthropic API key and switch the provider:
+
+   export ANTHROPIC_API_KEY=your-key
+   LLM_PROVIDER=anthropic ANTHROPIC_MODEL=claude-sonnet-4-20250514 docker compose up --build
+
+Claude receives only the ticket and retrieved KB passages. Its JSON response
+is parsed into the Pydantic `ModelOutput` schema, retried once on a failed
+structured response, and then checked so citations can only refer to passages
+the model actually received. The embedding provider remains the local
+deterministic embedder unless separately changed.
+
+To use real OpenAI embeddings too:
+
+   LLM_PROVIDER=openai EMBEDDING_PROVIDER=openai \
+   OPENAI_API_KEY=your-key docker compose up --build
+
+The production embedding model is `text-embedding-3-small` with native
+`dimensions=1536`, matching the `vector(1536)` column. Apply the migration
+before starting an existing database, then re-ingest the KB because old
+vectors cannot be resized:
+
+   alembic upgrade head
+
+   docker exec files-service-b-1 python -m app.ingest kb
+
+For offline CI only, override `EMBEDDING_PROVIDER=hashing`; it uses the same
+1536-dimensional column but is not semantic-quality retrieval.
+
+LLM prompt tokens, completion tokens, and estimated cost are recorded in
+`triage_runs` and returned as `token_cost_usd`. Claude cost rates can be
+overridden with `ANTHROPIC_INPUT_COST_PER_1M` and
+`ANTHROPIC_OUTPUT_COST_PER_1M`.
+
 ## The endpoint
 
     POST /v1/triage
@@ -116,6 +152,42 @@ keeping the pipeline's shape (retrieval → forced JSON → citation resolution 
 composed confidence) identical to what a real model swap-in would use. Swap
 them via `get_embedding_client()` / `get_triage_model()`.
 
+## Metrics
+
+Prometheus metrics are exposed at:
+
+      GET /metrics
+
+The endpoint includes request outcomes, latency, confidence, refusal count,
+overload count, cache hits, retrieved chunk counts, in-flight requests, LLM
+tokens, and estimated LLM cost. Labels are bounded; request IDs and ticket
+content are never emitted as labels.
+
+Example scrape configuration:
+
+      - job_name: service-b
+         metrics_path: /metrics
+         static_configs:
+            - targets: [service-b:8000]
+
+      ## RAG evaluation
+
+      Offline RAG quality metrics are calculated separately from live Prometheus
+      monitoring. The labeled dataset is `evals/rag_eval.json`; it currently covers
+      VPN retrieval, MFA retrieval, and an unsupported-question refusal.
+
+      Run it against a seeded local database:
+
+         EMBEDDING_PROVIDER=hashing LLM_PROVIDER=rule-based \
+         DATABASE_URL=postgresql+asyncpg://b_user:b_pass@localhost:5433/service_b \
+         python -m app.evaluation evals/rag_eval.json
+
+      The report includes Recall@5, Precision@5, MRR, NDCG@5, category accuracy,
+      priority accuracy, refusal accuracy, citation precision/recall, grounded
+      response rate, latency, and confidence. The output is written to
+      `evals/rag_eval_report.json` and should be compared across changes rather
+      than treated as meaningful until the labeled dataset is large enough.
+
 ## Feedback
 
     POST /v1/feedback
@@ -154,6 +226,21 @@ runs as a scheduled job, never inside the API process.
 3. **deploy** (main branch only) — assumes an AWS IAM role via OIDC (no
    long-lived AWS secrets in the repo), pushes the image to ECR, and forces
    a new ECS deployment.
+
+The deploy job now pushes an immutable `${GITHUB_SHA}` image to ECR, renders
+that exact image into `deploy/ecs-task-definition.json`, and deploys the new
+task definition to ECS while waiting for service stability.
+
+Configure these GitHub repository values before merging to `main`:
+
+   Variables: AWS_REGION, AWS_ACCOUNT_ID, ECR_REPOSITORY, ECS_CLUSTER, ECS_SERVICE
+   Secret: AWS_DEPLOY_ROLE_ARN
+
+The AWS task execution role must read the three Secrets Manager values
+referenced in `deploy/ecs-task-definition.json` (`database-url`,
+`anthropic-api-key`, and `openai-api-key`). Create the ECR repository, ECS
+cluster/service, CloudWatch log group `/ecs/service-b`, task roles, and target
+group/ALB before enabling deploys.
 
 To enable deploys, add a repository secret `AWS_DEPLOY_ROLE_ARN` pointing at
 an IAM role trusted for GitHub's OIDC provider, and create the ECR repo,

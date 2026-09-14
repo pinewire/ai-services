@@ -10,8 +10,9 @@ import hashlib
 import math
 import os
 import re
+from typing import Any
 
-EMBEDDING_DIM = 1024
+EMBEDDING_DIM = 1536
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 
@@ -42,8 +43,28 @@ class HashingEmbeddingClient(EmbeddingClient):
         return [_hash_embed(t) for t in texts]
 
 
+class OpenAIEmbeddingClient(EmbeddingClient):
+    """OpenAI embeddings sized for the vector(1536) column."""
+
+    def __init__(self) -> None:
+        from openai import AsyncOpenAI
+
+        self._client = AsyncOpenAI()
+        self._model = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        response: Any = await self._client.embeddings.create(
+            model=self._model,
+            input=texts,
+            dimensions=EMBEDDING_DIM,
+        )
+        return [item.embedding for item in sorted(response.data, key=lambda item: item.index)]
+
+
 def get_embedding_client() -> EmbeddingClient:
     provider = os.getenv("EMBEDDING_PROVIDER", "hashing")
     if provider == "hashing":
         return HashingEmbeddingClient()
+    if provider == "openai":
+        return OpenAIEmbeddingClient()
     raise ValueError(f"Unknown EMBEDDING_PROVIDER: {provider}")
