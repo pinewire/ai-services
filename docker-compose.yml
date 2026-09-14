@@ -5,6 +5,15 @@ services:
       - "8001:8000"   # host 8001: port 8000 is already used by another local process on this machine
     environment:
       PROMPT_VERSION: pipeline-v1
+      LLM_PROVIDER: ${LLM_PROVIDER:-rule-based}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-4-6}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-openai}
+      OPENAI_EMBEDDING_MODEL: ${OPENAI_EMBEDDING_MODEL:-text-embedding-3-small}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_INPUT_COST_PER_1M: ${ANTHROPIC_INPUT_COST_PER_1M:-3.00}
+      ANTHROPIC_OUTPUT_COST_PER_1M: ${ANTHROPIC_OUTPUT_COST_PER_1M:-15.00}
+      TRIAGE_TIMEOUT_SECONDS: ${TRIAGE_TIMEOUT_SECONDS:-30}
       DATABASE_URL: postgresql+asyncpg://b_user:b_pass@db:5432/service_b
     depends_on:
       db:

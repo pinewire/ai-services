@@ -5,6 +5,8 @@ KB seeding happens once per session in conftest.py.
 import os
 import uuid
 
+import pytest
+
 os.environ.setdefault(
     "DATABASE_URL", "postgresql+asyncpg://b_user:b_pass@localhost:5433/service_b"
 )
@@ -12,6 +14,7 @@ os.environ.setdefault(
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app.main import app  # noqa: E402
+from app.llm import get_triage_model  # noqa: E402
 
 
 def _payload(subject: str, body: str, request_id: str | None = None) -> dict:
@@ -42,6 +45,13 @@ def test_readyz_reports_db_connectivity() -> None:
         resp = client.get("/readyz")
     assert resp.status_code == 200
     assert resp.json()["status"] == "ready"
+
+
+def test_metrics_exposes_prometheus_data() -> None:
+    with TestClient(app) as client:
+        resp = client.get("/metrics")
+    assert resp.status_code == 200
+    assert "service_b_triage_requests_total" in resp.text
 
 
 def test_triage_grounds_reply_in_retrieved_chunk() -> None:
@@ -79,10 +89,21 @@ def test_triage_is_idempotent_on_request_id() -> None:
 
 
 def test_triage_fail_param_returns_503() -> None:
+    request_id = str(uuid.uuid4())
     with TestClient(app) as client:
-        resp = client.post("/v1/triage?fail=true", json=_payload("VPN issue", "vpn drops"))
+        resp = client.post(
+            "/v1/triage?fail=true",
+            json=_payload("VPN issue", "vpn drops", request_id=request_id),
+        )
     assert resp.status_code == 503
     assert resp.headers["retry-after"] == "30"
+    assert resp.headers["x-request-id"] == request_id
+
+
+def test_unknown_llm_provider_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LLM_PROVIDER", "unknown-provider")
+    with pytest.raises(ValueError, match="Unknown LLM_PROVIDER"):
+        get_triage_model()
 
 
 def test_feedback_links_to_run() -> None:

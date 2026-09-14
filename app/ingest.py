@@ -10,6 +10,8 @@ import asyncio
 import sys
 from pathlib import Path
 
+from sqlalchemy import select
+
 from app.db import Base, async_session, engine, ensure_extensions
 from app.embeddings import get_embedding_client
 from app.models import KbChunk, KbDocument
@@ -54,7 +56,13 @@ async def ingest_path(path: Path) -> None:
 
     async with async_session() as session:
         for file in sorted(path.glob("*.md")):
-            document = KbDocument(title=file.stem, source_url=str(file))
+            source_url = file.name
+            existing = await session.scalar(select(KbDocument).where(KbDocument.source_url == source_url))
+            if existing is not None:
+                await session.delete(existing)
+                await session.flush()
+
+            document = KbDocument(title=file.stem, source_url=source_url)
             session.add(document)
             await session.flush()
 

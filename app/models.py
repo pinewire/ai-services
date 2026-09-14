@@ -18,7 +18,7 @@ from sqlalchemy.schema import Computed
 
 from app.db import Base
 
-EMBEDDING_DIM = 1024
+EMBEDDING_DIM = 1536
 
 
 class KbDocument(Base):

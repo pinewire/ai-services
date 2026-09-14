@@ -12,12 +12,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.confidence import compute_confidence
 from app.embeddings import get_embedding_client
 from app.llm import get_triage_model
+from app.metrics import (
+    llm_cost_usd_total,
+    llm_tokens_total,
+    retrieval_chunks_returned,
+    triage_cache_hits_total,
+    triage_confidence,
+    triage_refusals_total,
+)
 from app.models import TriageRun
 from app.retrieval import retrieve
 from app.schemas import Citation, TriageRequest, TriageResponse
 
 PROMPT_VERSION = "pipeline-v1"
-MODEL_NAME = "rule-based-v1"
 
 
 def _ticket_text(payload: TriageRequest) -> str:
@@ -35,29 +42,35 @@ async def _persist_run(
     input_hash: str,
     retrieved_chunk_ids: list,
     response: TriageResponse,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
 ) -> None:
-    session.add(
-        TriageRun(
-            request_id=payload.request_id,
-            input_hash=input_hash,
-            retrieved_chunk_ids=retrieved_chunk_ids,
-            model=response.model,
-            prompt_version=response.prompt_version,
-            output=response.model_dump(mode="json"),
-            confidence=response.confidence,
-            latency_ms=response.latency_ms,
-        )
-    )
+    run = await session.scalar(select(TriageRun).where(TriageRun.request_id == payload.request_id))
+    if run is None:
+        run = TriageRun(request_id=payload.request_id)
+        session.add(run)
+    run.input_hash = input_hash
+    run.retrieved_chunk_ids = retrieved_chunk_ids
+    run.model = response.model
+    run.prompt_version = response.prompt_version
+    run.output = response.model_dump(mode="json")
+    run.confidence = response.confidence
+    run.latency_ms = response.latency_ms
+    run.prompt_tokens = prompt_tokens
+    run.completion_tokens = completion_tokens
+    run.cost_usd = response.token_cost_usd
     await session.commit()
 
 
 async def run_triage(session: AsyncSession, payload: TriageRequest) -> TriageResponse:
     started = time.perf_counter()
+    model = get_triage_model()
 
     # 1. Idempotency check — A's synchronous attempt and its outbox worker
     # can both fire for the same ticket; the second one gets the cached run.
     existing = await session.scalar(select(TriageRun).where(TriageRun.request_id == payload.request_id))
-    if existing is not None:
+    if existing is not None and existing.model == model.model_name:
+        triage_cache_hits_total.labels(cache="request_id").inc()
         return TriageResponse.model_validate({**existing.output, "request_id": existing.request_id})
 
     ticket_text = _ticket_text(payload)
@@ -68,7 +81,8 @@ async def run_triage(session: AsyncSession, payload: TriageRequest) -> TriageRes
     cached = await session.scalar(
         select(TriageRun).where(TriageRun.input_hash == input_hash).order_by(TriageRun.created_at.desc())
     )
-    if cached is not None:
+    if cached is not None and cached.model == model.model_name:
+        triage_cache_hits_total.labels(cache="input_hash").inc()
         response = TriageResponse.model_validate({**cached.output, "request_id": payload.request_id})
         await _persist_run(session, payload, input_hash, cached.retrieved_chunk_ids, response)
         return response
@@ -76,9 +90,11 @@ async def run_triage(session: AsyncSession, payload: TriageRequest) -> TriageRes
     # 2-5. Embed the ticket, hybrid-retrieve, fuse with reciprocal rank fusion.
     [embedding] = await get_embedding_client().embed([ticket_text])
     chunks = await retrieve(session, ticket_text, embedding)
+    retrieval_chunks_returned.observe(len(chunks))
 
     # 6-7. Prompt + forced-JSON model call (validated, reject-and-retry once).
-    output = await get_triage_model().classify(ticket_text, chunks)
+    model_result = await model.classify(ticket_text, chunks)
+    output = model_result.output
 
     # 8. Resolve citations against the retrieved set only — a chunk ID the
     # model never saw is confabulation even if it exists in the KB.
@@ -103,11 +119,29 @@ async def run_triage(session: AsyncSession, payload: TriageRequest) -> TriageRes
         suggested_reply=suggested_reply,
         clarifying_questions=clarifying_questions,
         citations=citations,
-        model=MODEL_NAME,
+        model=model.model_name,
         prompt_version=PROMPT_VERSION,
         latency_ms=int((time.perf_counter() - started) * 1000),
-        token_cost_usd=0.0,
+        token_cost_usd=model_result.token_cost_usd,
     )
 
-    await _persist_run(session, payload, input_hash, [c.chunk_id for c in chunks], response)
+    triage_confidence.observe(response.confidence)
+    if response.category == "other" and not response.suggested_reply:
+        triage_refusals_total.inc()
+    if model_result.prompt_tokens:
+        llm_tokens_total.labels(type="prompt").inc(model_result.prompt_tokens)
+    if model_result.completion_tokens:
+        llm_tokens_total.labels(type="completion").inc(model_result.completion_tokens)
+    if model_result.token_cost_usd:
+        llm_cost_usd_total.inc(model_result.token_cost_usd)
+
+    await _persist_run(
+        session,
+        payload,
+        input_hash,
+        [c.chunk_id for c in chunks],
+        response,
+        prompt_tokens=model_result.prompt_tokens,
+        completion_tokens=model_result.completion_tokens,
+    )
     return response

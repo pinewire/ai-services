@@ -9,14 +9,22 @@ guarantees not depend on B's.
 import asyncio
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Query, Response, status
 from fastapi.responses import JSONResponse
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from sqlalchemy import select, text
 
 from app.concurrency import limiter
 from app.db import Base, async_session, engine, ensure_extensions
+from app.metrics import (
+    inflight_triage,
+    triage_latency_seconds,
+    triage_overloaded_total,
+    triage_requests_total,
+)
 from app.models import Feedback, TriageRun
 from app.pipeline import run_triage
 from app.schemas import (
@@ -34,6 +42,7 @@ logging.basicConfig(
 log = logging.getLogger("service-b")
 
 PROMPT_VERSION = os.getenv("PROMPT_VERSION", "pipeline-v1")
+TRIAGE_TIMEOUT_SECONDS = float(os.getenv("TRIAGE_TIMEOUT_SECONDS", "30"))
 
 
 @asynccontextmanager
@@ -59,6 +68,12 @@ app = FastAPI(
 async def healthz() -> dict[str, str]:
     """Liveness. Is the process up?"""
     return {"status": "ok"}
+
+
+@app.get("/metrics", include_in_schema=False)
+async def metrics() -> Response:
+    """Prometheus scrape endpoint."""
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/readyz", include_in_schema=False, response_model=None)
@@ -88,18 +103,17 @@ async def triage(
     delay_ms: int = Query(0, ge=0, le=30_000, description="Simulate a slow model call"),
     fail: bool = Query(False, description="Simulate B being overloaded"),
 ) -> TriageResponse | JSONResponse:
+    started = time.perf_counter()
     log.info("triage.received request_id=%s ticket_ref=%s", payload.request_id, payload.ticket_ref)
 
-    if delay_ms:
-        # await, not sleep — this is why the framework is async. One slow
-        # request must not occupy the event loop.
-        await asyncio.sleep(delay_ms / 1000)
-
     if fail or not await limiter.try_acquire():
+        triage_overloaded_total.inc()
+        triage_requests_total.labels(outcome="overloaded").inc()
+        triage_latency_seconds.observe(time.perf_counter() - started)
         log.warning("triage.overloaded request_id=%s", payload.request_id)
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            headers={"Retry-After": "30"},
+            headers={"Retry-After": "30", "X-Request-Id": str(payload.request_id)},
             content=ErrorResponse(
                 error="overloaded",
                 detail="Backpressure. Retry via the outbox.",
@@ -107,21 +121,43 @@ async def triage(
             ).model_dump(mode="json"),
         )
 
+    inflight_triage.inc()
     try:
+        if delay_ms:
+            # await, not sleep — this is why the framework is async. One slow
+            # request must not occupy the event loop.
+            await asyncio.sleep(delay_ms / 1000)
         async with async_session() as session:
-            result = await run_triage(session, payload)
+            async with asyncio.timeout(TRIAGE_TIMEOUT_SECONDS):
+                result = await run_triage(session, payload)
+        outcome = "refused" if result.category == "other" else "success"
+        triage_requests_total.labels(outcome=outcome).inc()
+        triage_latency_seconds.observe(time.perf_counter() - started)
+        response.headers["X-Request-Id"] = str(payload.request_id)
+        log.info(
+            "triage.completed request_id=%s category=%s confidence=%.2f latency_ms=%d",
+            payload.request_id,
+            result.category,
+            result.confidence,
+            result.latency_ms,
+        )
+        return result
+    except Exception:
+        triage_requests_total.labels(outcome="error").inc()
+        triage_latency_seconds.observe(time.perf_counter() - started)
+        error_response = ErrorResponse(
+            error="triage_failed",
+            detail="Triage provider failed. Retry via the outbox.",
+            request_id=payload.request_id,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            headers={"Retry-After": "30", "X-Request-Id": str(payload.request_id)},
+            content=error_response.model_dump(mode="json"),
+        )
     finally:
+        inflight_triage.dec()
         await limiter.release()
-
-    response.headers["X-Request-Id"] = str(payload.request_id)
-    log.info(
-        "triage.completed request_id=%s category=%s confidence=%.2f latency_ms=%d",
-        payload.request_id,
-        result.category,
-        result.confidence,
-        result.latency_ms,
-    )
-    return result
 
 
 @app.post(
