@@ -2,9 +2,10 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+.git/
+.gitignore
 .pytest_cache/
 .mypy_cache/
+tests/
+*.md
 .env
-*.egg-info/
-.ruff_cache/
-evals/rag_eval_report.json
