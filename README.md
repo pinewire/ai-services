@@ -27,6 +27,17 @@ The database contains `kb_documents`, `kb_chunks`, `triage_runs`, and `feedback`
 
 Ingestion is idempotent by source filename. Re-run it after changing embedding providers or KB documents.
 
+### Chunking strategy
+
+`app/chunking.py` implements heading-aware recursive character text
+splitting: each Markdown document is first split at `#`-style headings, then
+each section is recursively split on progressively finer separators
+(paragraph breaks, then lines, then sentences, then words) until every piece
+fits within `chunk_size` (1000 characters). Adjacent pieces are packed back
+together up to that limit, carrying `chunk_overlap` (150 characters) of
+trailing context into the next chunk so facts near a boundary aren't lost
+from every chunk that could retrieve them.
+
 ## API
 
 - `POST /v1/triage`

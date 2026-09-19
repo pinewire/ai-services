@@ -12,39 +12,20 @@ from pathlib import Path
 
 from sqlalchemy import select
 
+from app.chunking import chunk_document
 from app.db import Base, async_session, engine, ensure_extensions
 from app.embeddings import get_embedding_client
 from app.models import KbChunk, KbDocument
 
-_CHUNK_SIZE_WORDS = 180
+CHUNK_SIZE_CHARS = 1_000
+CHUNK_OVERLAP_CHARS = 150
 
 
 def _chunk_text(raw: str) -> list[tuple[str, str]]:
-    """Split on markdown headings; within a section, chunk by word count.
-    Returns (heading_path, chunk_content) pairs.
+    """Heading-aware recursive character splitting. Returns
+    (heading_path, chunk_content) pairs. See `app.chunking` for the strategy.
     """
-    sections: list[tuple[str, str]] = []
-    heading = ""
-    lines: list[str] = []
-    for line in raw.splitlines():
-        if line.startswith("#"):
-            if lines:
-                sections.append((heading, "\n".join(lines)))
-                lines = []
-            heading = line.lstrip("#").strip()
-        else:
-            lines.append(line)
-    if lines:
-        sections.append((heading, "\n".join(lines)))
-
-    chunks: list[tuple[str, str]] = []
-    for section_heading, body in sections:
-        words = body.split()
-        for i in range(0, len(words), _CHUNK_SIZE_WORDS):
-            piece = " ".join(words[i : i + _CHUNK_SIZE_WORDS]).strip()
-            if piece:
-                chunks.append((section_heading, piece))
-    return chunks
+    return chunk_document(raw, chunk_size=CHUNK_SIZE_CHARS, chunk_overlap=CHUNK_OVERLAP_CHARS)
 
 
 async def ingest_path(path: Path) -> None:
