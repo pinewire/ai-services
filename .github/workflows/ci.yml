@@ -1,4 +1,4 @@
-name: Service B CI/CD
+name: Service B CI
 
 on:
   push:
@@ -55,59 +55,3 @@ jobs:
         with:
           name: rag-evaluation-report
           path: evals/rag_eval_report.json
-
-  build-and-push:
-    needs: test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
-    env:
-      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
-      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY || 'service-b' }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Login to ECR
-        id: ecr-login
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Build and push immutable image
-        env:
-          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
-        run: |
-          docker build \
-            --label org.opencontainers.image.revision=${{ github.sha }} \
-            --label org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }} \
-            -t "$REGISTRY/$ECR_REPOSITORY:${{ github.sha }}" .
-          docker push "$REGISTRY/$ECR_REPOSITORY:${{ github.sha }}"
-
-      - name: Prepare ECS task definition
-        env:
-          AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
-        run: |
-          test -n "$AWS_ACCOUNT_ID"
-          sed -i "s/<AWS_ACCOUNT_ID>/$AWS_ACCOUNT_ID/g; s/<AWS_REGION>/${AWS_REGION}/g" deploy/ecs-task-definition.json
-
-      - name: Render ECS task definition
-        id: task-def
-        uses: aws-actions/amazon-ecs-render-task-definition@v1
-        with:
-          task-definition: deploy/ecs-task-definition.json
-          container-name: service-b
-          image: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
-
-      - name: Deploy to ECS
-        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
-        with:
-          task-definition: ${{ steps.task-def.outputs.task-definition }}
-          service: ${{ vars.ECS_SERVICE || 'service-b' }}
-          cluster: ${{ vars.ECS_CLUSTER || 'service-b-cluster' }}
-          wait-for-service-stability: true
