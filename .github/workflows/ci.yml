@@ -76,18 +76,15 @@ jobs:
           if-no-files-found: warn
 
   # Builds on every PR (proves the Dockerfile works and the container boots).
-  # Pushes to ECR only on merges to main. The image is built ONCE here and the
+  # Pushes to Artifactory only on merges to main. The image is built ONCE here and the
   # same bytes are what CD deploys — CD never rebuilds.
   build:
-    name: Build image (push to ECR on main)
+    name: Build image (push to Artifactory on main)
     needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write # GitHub OIDC -> AWS role. No long-lived AWS keys in secrets.
     env:
-      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
-      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY || 'service-b' }}
       LOCAL_IMAGE: service-b:${{ github.sha }}
       PUBLISH: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     outputs:
@@ -127,27 +124,22 @@ jobs:
           docker logs smoke
           exit 1
 
-      - name: Configure AWS credentials
+      - name: Log in to Artifactory
         if: env.PUBLISH == 'true'
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: docker/login-action@v3
         with:
-          role-to-assume: ${{ secrets.AWS_ECR_PUSH_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
+          registry: ${{ vars.ARTIFACTORY_REGISTRY }}
+          username: ${{ secrets.ARTIFACTORY_USERNAME }}
+          password: ${{ secrets.ARTIFACTORY_TOKEN }}
 
-      - name: Log in to ECR
-        if: env.PUBLISH == 'true'
-        id: ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
-      # Tagged with the git SHA only. The ECR repo is IMMUTABLE, so a tag can
-      # never be repointed — there is deliberately no mutable :latest.
-      - name: Push to ECR
+      # Tagged with the git SHA only. Set the Artifactory repository to block
+      # overwriting existing tags, so a tag can never be repointed after CI
+      # has tested it. There is deliberately no mutable :latest.
+      - name: Push to Artifactory
         if: env.PUBLISH == 'true'
         id: push
-        env:
-          REGISTRY: ${{ steps.ecr.outputs.registry }}
         run: |
-          IMAGE="$REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA"
+          IMAGE="${{ vars.ARTIFACTORY_REGISTRY }}/${{ vars.ARTIFACTORY_REPO }}/service-b:$GITHUB_SHA"
           docker tag "$LOCAL_IMAGE" "$IMAGE"
           docker push "$IMAGE"
           DIGEST_REF=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE")
