@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -24,6 +28,9 @@ jobs:
           --health-timeout 3s
           --health-retries 10
 
+    env:
+      DATABASE_URL: postgresql+asyncpg://b_user:b_pass@localhost:5432/service_b
+
     steps:
       - uses: actions/checkout@v4
 
@@ -31,6 +38,12 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+          # cache: pip only looks for requirements.txt / pyproject.toml by
+          # default, so it must be told about requirements-dev.txt or the step
+          # errors out before dependencies are ever installed.
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
 
       - name: Install dependencies
         run: pip install -r requirements-dev.txt
@@ -39,19 +52,109 @@ jobs:
         run: ruff check .
 
       - name: Test
-        env:
-          DATABASE_URL: postgresql+asyncpg://b_user:b_pass@localhost:5432/service_b
         run: pytest -v
+
+      # The eval runs as its own process, outside pytest, so the conftest
+      # fixture that seeds the KB does not apply here.
+      - name: Seed knowledge base
+        env:
+          EMBEDDING_PROVIDER: hashing
+        run: python -m app.ingest kb
 
       - name: RAG evaluation
         env:
-          DATABASE_URL: postgresql+asyncpg://b_user:b_pass@localhost:5432/service_b
           EMBEDDING_PROVIDER: hashing
           LLM_PROVIDER: rule-based
         run: python -m app.evaluation evals/rag_eval.json
 
       - name: Upload RAG evaluation report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: rag-evaluation-report
           path: evals/rag_eval_report.json
+          if-no-files-found: warn
+
+  # Builds on every PR (proves the Dockerfile works and the container boots).
+  # Pushes to ECR only on merges to main. The image is built ONCE here and the
+  # same bytes are what CD deploys — CD never rebuilds.
+  build:
+    name: Build image (push to ECR on main)
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # GitHub OIDC -> AWS role. No long-lived AWS keys in secrets.
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY || 'service-b' }}
+      LOCAL_IMAGE: service-b:${{ github.sha }}
+      PUBLISH: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    outputs:
+      image: ${{ steps.push.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: ${{ env.LOCAL_IMAGE }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
+      # /healthz needs no database, so this proves the image starts and serves
+      # without standing up Postgres. Catches missing files and import errors.
+      - name: Smoke test the container
+        run: |
+          docker run -d --name smoke -p 8000:8000 "$LOCAL_IMAGE"
+          for _ in $(seq 1 30); do
+            if curl -fsS localhost:8000/healthz > /dev/null; then
+              echo "container is serving"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "container never became healthy"
+          docker logs smoke
+          exit 1
+
+      - name: Configure AWS credentials
+        if: env.PUBLISH == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ECR_PUSH_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        if: env.PUBLISH == 'true'
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Tagged with the git SHA only. The ECR repo is IMMUTABLE, so a tag can
+      # never be repointed — there is deliberately no mutable :latest.
+      - name: Push to ECR
+        if: env.PUBLISH == 'true'
+        id: push
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          IMAGE="$REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA"
+          docker tag "$LOCAL_IMAGE" "$IMAGE"
+          docker push "$IMAGE"
+          DIGEST_REF=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE")
+          echo "image=$DIGEST_REF" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Image pushed"
+            echo ""
+            echo "- tag: \`$IMAGE\`"
+            echo "- digest: \`$DIGEST_REF\`"
+          } >> "$GITHUB_STEP_SUMMARY"
