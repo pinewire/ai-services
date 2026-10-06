@@ -18,7 +18,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from sqlalchemy import select, text
 
 from app.concurrency import limiter
-from app.db import Base, async_session, engine, ensure_extensions
+from app.db import async_session, engine
 from app.metrics import (
     inflight_triage,
     triage_latency_seconds,
