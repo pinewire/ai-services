@@ -47,12 +47,11 @@ TRIAGE_TIMEOUT_SECONDS = float(os.getenv("TRIAGE_TIMEOUT_SECONDS", "30"))
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    async with engine.begin() as conn:
-        await ensure_extensions(conn)
-        await conn.run_sync(Base.metadata.create_all)
+    # Schema is owned by Alembic, not the app. The app must start even when
+    # Postgres is unreachable so /healthz can answer and /readyz can report
+    # the truth — a pod that exits on a transient DB failure crash-loops
+    # instead of being drained from the load balancer and recovering.
     yield
-    # Dispose pooled connections so a fresh event loop (e.g. the next test
-    # run) doesn't inherit asyncpg connections tied to a closed loop.
     await engine.dispose()
 
 

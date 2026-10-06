@@ -30,3 +30,14 @@ def seed_kb() -> None:
         await ingest_path(KB_DIR)
 
     asyncio.run(_reset_and_seed())
+
+
+# The app no longer creates tables at startup, so the test session does it.
+@pytest_asyncio.fixture(scope="session", autouse=True)
+async def _schema():
+    from app.db import Base, engine, ensure_extensions
+
+    async with engine.begin() as conn:
+        await ensure_extensions(conn)
+        await conn.run_sync(Base.metadata.create_all)
+    yield

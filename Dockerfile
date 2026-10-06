@@ -19,6 +19,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 COPY kb ./kb
+COPY alembic.ini ./
+COPY alembic ./alembic
 
 
 # Run as a non-root user. If the process is compromised it should not own the
