@@ -1,0 +1,49 @@
+# Re-ingests the knowledge base: chunks every file under kb/, embeds each
+# chunk, and writes kb_documents/kb_chunks.
+#
+# Deliberately NOT part of the kustomization. It calls the OpenAI embeddings
+# API, so running it on every pod start would cost money and add minutes to
+# rollouts. Run it by hand after a migration that changes the embedding
+# dimension, and after any change to kb/.
+#
+#   kubectl delete job kb-ingest -n service-b --ignore-not-found
+#   kubectl apply -f k8s/jobs/kb-ingest.yaml
+#   kubectl logs -n service-b job/kb-ingest -f
+#
+# Job names are immutable, hence the delete first.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kb-ingest
+  namespace: service-b
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: ingest
+          image: ghcr.io/pinewire/service-b:7608ba7
+          command: ["python", "-m", "app.ingest", "kb"]
+          envFrom:
+            - configMapRef:
+                name: service-b-config
+            - secretRef:
+                name: service-b-secrets
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

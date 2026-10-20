@@ -1,0 +1,17 @@
+# Non-secret configuration only. ANTHROPIC_API_KEY, OPENAI_API_KEY and
+# DATABASE_URL live in the `service-b-secrets` Secret, which is created
+# out-of-band and never committed.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: service-b-config
+data:
+  PROMPT_VERSION: "pipeline-v1"
+  LLM_PROVIDER: "anthropic"
+  ANTHROPIC_MODEL: "claude-sonnet-4-6"
+  EMBEDDING_PROVIDER: "openai"
+  OPENAI_EMBEDDING_MODEL: "text-embedding-3-small"
+  ANTHROPIC_INPUT_COST_PER_1M: "3.00"
+  ANTHROPIC_OUTPUT_COST_PER_1M: "15.00"
+  TRIAGE_TIMEOUT_SECONDS: "30"
+  MAX_INFLIGHT_TRIAGE: "8"
