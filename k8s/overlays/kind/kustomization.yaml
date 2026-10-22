@@ -1,0 +1,16 @@
+# Local kind cluster. The image is built on the host and side-loaded with
+# `kind load docker-image`, so it must never be pulled — hence a local tag
+# and imagePullPolicy: Never. Nothing here reaches a registry.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+images:
+  - name: service-b
+    newName: service-b
+    newTag: dev
+
+patches:
+  - path: pull-policy.yaml
