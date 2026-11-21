@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pydantic import BaseModel, ValidationError
 
 from app.retrieval import RetrievedChunk
-from app.schemas import Priority
+from app.schemas import Category, Priority
 
 _REFUSAL_QUESTIONS = [
     "What exactly happens when you try — any error message on screen?",
@@ -22,17 +22,22 @@ _REFUSAL_QUESTIONS = [
 ]
 
 _CATEGORY_RULES: list[tuple[tuple[str, ...], str, Priority]] = [
-    (("vpn", "network", "wifi", "connection"), "network.vpn", Priority.p2),
-    (("password", "login", "locked out", "mfa"), "access.password", Priority.p3),
-    (("laptop", "screen", "keyboard", "battery"), "hardware.laptop", Priority.p3),
-    (("payroll", "invoice", "expense"), "finance.systems", Priority.p2),
+    (("vpn", "network", "wifi", "connection"), Category.network_vpn, Priority.p2),
+    (("password", "login", "locked out", "mfa"), Category.access_password, Priority.p3),
+    (("laptop", "screen", "keyboard", "battery"), Category.hardware_laptop, Priority.p3),
+    (("payroll", "invoice", "expense"), Category.finance_systems, Priority.p2),
 ]
 
 
 class ModelOutput(BaseModel):
     """The forced-JSON shape the model must return."""
 
-    category: str
+    # Deliberately the enum, not `str`. The model can return anything it
+    # likes; this is where a category nobody agreed to becomes a validation
+    # error, which the reject-and-retry loop in `classify()` turns into a
+    # second attempt and then a refusal. With a bare `str` an invented
+    # category reached Service A and routed a real ticket nowhere.
+    category: Category
     priority: Priority
     suggested_reply: str | None
     clarifying_questions: list[str]
@@ -49,7 +54,7 @@ class ModelCallResult:
 
 def _refusal() -> ModelOutput:
     return ModelOutput(
-        category="other",
+        category=Category.other,
         priority=Priority.p3,
         suggested_reply=None,
         clarifying_questions=_REFUSAL_QUESTIONS,
@@ -128,15 +133,24 @@ class AnthropicTriageModel(TriageModel):
             f"CHUNK_ID: {chunk.chunk_id}\nTITLE: {chunk.doc_title}\nCONTENT: {chunk.content}"
             for chunk in chunks
         )
+        # The category list is generated from the enum rather than written out
+        # here, so adding a member cannot leave the prompt and the validator
+        # disagreeing — the failure that produces is a model returning a
+        # category the schema then rejects, which looks like a flaky model.
+        categories = " | ".join(f'"{c.value}"' for c in Category)
         system = (
             "You are a helpdesk triage engine. Classify the ticket and draft a reply "
             "using only the supplied knowledge-base passages. Return ONLY valid JSON "
-            "matching this shape: {\"category\": string, \"priority\": \"p1\"|\"p2\"|\"p3\"|\"p4\", "
+            f"matching this shape: {{\"category\": {categories}, "
+            "\"priority\": \"p1\"|\"p2\"|\"p3\"|\"p4\", "
             "\"suggested_reply\": string|null, \"clarifying_questions\": string[], "
-            "\"cited_chunk_ids\": string[]}. If the passages do not support a grounded answer, "
-            "return category 'other', suggested_reply null, clarifying questions, and no "
-            "cited_chunk_ids. cited_chunk_ids must contain only exact CHUNK_ID values from "
-            "the passages."
+            "\"cited_chunk_ids\": string[]}. category must be exactly one of the listed "
+            "values and nothing else — do not invent a new one, and do not reshape a "
+            "ticket to fit a category that is nearly right. If the passages do not "
+            "support a grounded answer, or no listed category genuinely applies, "
+            "return category \"other\", suggested_reply null, clarifying questions, and "
+            "no cited_chunk_ids. cited_chunk_ids must contain only exact CHUNK_ID values "
+            "from the passages."
         )
         user_message = f"TICKET:\n{ticket_text}\n\nKNOWLEDGE BASE:\n{context or '(no relevant passages)'}"
 

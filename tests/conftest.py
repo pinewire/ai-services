@@ -16,6 +16,13 @@ os.environ.setdefault(
     "DATABASE_URL", "postgresql+asyncpg://b_user:b_pass@localhost:5433/service_b"
 )
 
+# The endpoints require an API key in every other environment. The existing
+# tests call them without one, so auth is off by default here and the tests
+# that do exercise it turn it back on around themselves. Set before any app
+# module is imported, because the flag is read at request time but the
+# dependency is wired at import time.
+os.environ.setdefault("AUTH_REQUIRED", "false")
+
 import pytest  # noqa: E402
 from sqlalchemy import text  # noqa: E402
 

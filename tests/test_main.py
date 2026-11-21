@@ -13,6 +13,7 @@ os.environ.setdefault(
 
 from fastapi.testclient import TestClient  # noqa: E402
 
+from app import main  # noqa: E402
 from app.main import app  # noqa: E402
 from app.llm import get_triage_model  # noqa: E402
 
@@ -80,23 +81,56 @@ def test_triage_refuses_when_nothing_relevant_is_retrieved() -> None:
 
 
 def test_triage_is_idempotent_on_request_id() -> None:
+    """The *judgement* is identical; the accounting describes this call.
+
+    A replay deliberately differs in `replayed`, `token_cost_usd` and
+    `latency_ms`, because A sums the cost field and measures the latency
+    field. Asserting whole-response equality would lock in the double
+    counting this used to have.
+    """
     request_id = str(uuid.uuid4())
     payload = _payload("VPN drops after about 30 seconds", "Error VPN-4021 again.", request_id=request_id)
     with TestClient(app) as client:
         first = client.post("/v1/triage", json=payload).json()
         second = client.post("/v1/triage", json=payload).json()
-    assert first == second
+
+    verdict = ("status", "category", "priority", "confidence", "suggested_reply",
+               "clarifying_questions", "citations", "model", "prompt_version")
+    assert {k: first[k] for k in verdict} == {k: second[k] for k in verdict}
+
+    assert first["replayed"] is False
+    assert second["replayed"] is True
+    assert second["token_cost_usd"] == 0.0
 
 
-def test_triage_fail_param_returns_503() -> None:
+def test_triage_fail_param_is_inert_unless_enabled() -> None:
+    """Reachable chaos params are a free denial-of-service."""
+    request_id = str(uuid.uuid4())
+    with TestClient(app) as client:
+        resp = client.post(
+            "/v1/triage?fail=true&delay_ms=30000",
+            json=_payload("VPN issue", "vpn drops", request_id=request_id),
+        )
+    assert resp.status_code == 200
+
+
+def test_triage_fail_param_returns_429_when_enabled(monkeypatch) -> None:
+    """429, not 503: shedding load is B working, not B failing.
+
+    The flag is a module constant read at import time, so this patches the
+    attribute rather than the environment.
+    """
+    monkeypatch.setattr(main, "CHAOS_PARAMS_ENABLED", True)
     request_id = str(uuid.uuid4())
     with TestClient(app) as client:
         resp = client.post(
             "/v1/triage?fail=true",
             json=_payload("VPN issue", "vpn drops", request_id=request_id),
         )
-    assert resp.status_code == 503
-    assert resp.headers["retry-after"] == "30"
+    assert resp.status_code == 429
+    assert resp.json()["error"] == "at_capacity"
+    # Short, because the in-flight queue drains in seconds.
+    assert resp.headers["retry-after"] == "5"
     assert resp.headers["x-request-id"] == request_id
 
 
