@@ -506,6 +506,8 @@ components:
           title: Ticket Ref
         subject:
           type: string
+          maxLength: 500
+          minLength: 1
           title: Subject
         messages:
           items:
@@ -538,6 +540,14 @@ components:
         status:
           $ref: '#/components/schemas/TriageStatus'
           default: ok
+        received_at:
+          type: string
+          format: date-time
+          title: Received At
+        completed_at:
+          type: string
+          format: date-time
+          title: Completed At
         category:
           $ref: '#/components/schemas/Category'
         priority:
@@ -581,6 +591,8 @@ components:
       type: object
       required:
       - request_id
+      - received_at
+      - completed_at
       - category
       - priority
       - confidence

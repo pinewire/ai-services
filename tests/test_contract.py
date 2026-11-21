@@ -7,6 +7,7 @@ A's integration tests. Needs a real Postgres, like test_main.py.
 
 import os
 import uuid
+from datetime import datetime
 
 os.environ.setdefault(
     "DATABASE_URL", "postgresql+asyncpg://b_user:b_pass@localhost:5433/service_b"
@@ -163,3 +164,42 @@ def test_contract_advertises_the_api_key_scheme() -> None:
     """Otherwise A discovers the header the first time it gets a 401."""
     schemes = app.openapi()["components"].get("securitySchemes", {})
     assert any(s.get("name") == "X-API-Key" for s in schemes.values()), schemes
+
+
+def test_timestamps_are_present_and_ordered() -> None:
+    """A asked for these so it can measure its own outbox queue delay."""
+    with TestClient(app) as client:
+        resp = client.post(
+            "/v1/triage",
+            json=_payload("VPN drops after about 30 seconds", "VPN connects then drops. VPN-4021."),
+        )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    received = datetime.fromisoformat(body["received_at"])
+    completed = datetime.fromisoformat(body["completed_at"])
+    assert received.tzinfo is not None, "must be offset-aware UTC, not naive"
+    assert completed >= received
+
+
+def test_suggested_reply_never_leaks_the_enum_repr() -> None:
+    """Regression: f-string formatting of a str-mixin Enum renders
+    'Category.network_vpn' on Python 3.11+, and this text is what a
+    customer reads.
+    """
+    with TestClient(app) as client:
+        resp = client.post(
+            "/v1/triage",
+            json=_payload("VPN drops after about 30 seconds", "VPN connects then drops. VPN-4021."),
+        )
+    reply = resp.json()["suggested_reply"] or ""
+    assert "Category." not in reply, reply
+    assert "Priority." not in reply, reply
+
+
+def test_subject_is_bounded_but_looser_than_As_limit() -> None:
+    """Server permissive, client strict — so an over-long subject fails at A."""
+    with TestClient(app) as client:
+        ok = client.post("/v1/triage", json=_payload("s" * 500, "vpn drops, VPN-4021"))
+        too_long = client.post("/v1/triage", json=_payload("s" * 501, "vpn drops, VPN-4021"))
+    assert ok.status_code == 200, ok.text
+    assert too_long.status_code == 422

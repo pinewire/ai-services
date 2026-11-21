@@ -99,7 +99,11 @@ class RuleBasedTriageModel(TriageModel):
                     category=category,
                     priority=priority,
                     suggested_reply=(
-                        f"Thanks for reporting this. This looks like a known {category} issue. "
+                        # .value, not the member: f-string formatting of a
+                        # str-mixin Enum renders "Category.network_vpn" on
+                        # Python 3.11+, which went straight into the reply
+                        # text a customer would read.
+                        f"Thanks for reporting this. This looks like a known {category.value} issue. "
                         f"Per {top.doc_title}: {top.content[:200].strip()}"
                     ),
                     clarifying_questions=[],

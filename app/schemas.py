@@ -8,6 +8,7 @@ so neither service can drift from the contract.
 import os
 from datetime import datetime
 from enum import Enum
+from typing import Any
 from typing import Literal
 from uuid import UUID
 
@@ -92,7 +93,12 @@ class Requester(BaseModel):
 class TriageRequest(BaseModel):
     request_id: UUID
     ticket_ref: str  # for logging only; B never looks it up
-    subject: str
+    # 500 rather than the 200 in A's draft on purpose: the server should be
+    # the more permissive of the two. A stricter limit on A's side inside a
+    # looser one here means an over-long subject is caught before it leaves
+    # A, where there is a ticket to attach the error to. The other way round,
+    # a 250-character email subject becomes a ticket that cannot be triaged.
+    subject: str = Field(min_length=1, max_length=500)
     messages: list[Message] = Field(min_length=1, max_length=MAX_MESSAGES)
     requester: Requester
     hints: dict[str, str] = Field(default_factory=dict)
@@ -125,6 +131,16 @@ class Citation(BaseModel):
 class TriageResponse(BaseModel):
     request_id: UUID
     status: TriageStatus = TriageStatus.ok
+
+    # B's own clock, both UTC. A asked for these and they are worth having:
+    # with A's received_at alongside them, the gap between A receiving a
+    # message and B starting work is measurable, which is the only way to
+    # see queue delay in A's outbox. They also make the two services' clocks
+    # reconcilable after the fact, which matters the first time a latency
+    # number from one side disagrees with the other.
+    received_at: datetime
+    completed_at: datetime
+
     category: Category
     priority: Priority
     confidence: float = Field(ge=0.0, le=1.0)
@@ -142,6 +158,19 @@ class TriageResponse(BaseModel):
     # multiplied by A's retry count.
     replayed: bool = False
     token_cost_usd: float
+
+    def replay_as(self, request_id: UUID, received_at: datetime, completed_at: datetime) -> "TriageResponse":
+        """This response's judgement, with this call's accounting."""
+        data: dict[str, Any] = self.model_dump()
+        data.update(
+            request_id=request_id,
+            received_at=received_at,
+            completed_at=completed_at,
+            replayed=True,
+            token_cost_usd=0.0,
+            latency_ms=int((completed_at - received_at).total_seconds() * 1000),
+        )
+        return TriageResponse.model_validate(data)
 
 
 class ErrorResponse(BaseModel):
