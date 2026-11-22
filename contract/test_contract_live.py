@@ -54,6 +54,42 @@ def client() -> httpx.Client:
         yield c
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _is_actually_service_b() -> None:
+    """Fail once, clearly, when SERVICE_B_URL points somewhere else.
+
+    Without this the whole suite fails 23 times with `{"detail":"Not Found"}`
+    and `ErrorResponse not in spec`, which reads like a broken contract
+    rather than a wrong URL. Pointing at another FastAPI app on a port you
+    forgot was occupied is an easy mistake — uvicorn's "address already in
+    use" scrolls past and the previous process keeps answering.
+    """
+    with httpx.Client(base_url=BASE_URL, timeout=TIMEOUT) as probe:
+        try:
+            resp = probe.get("/openapi.json")
+        except httpx.ConnectError:
+            # Nothing listening at all: skip rather than abort. These tests
+            # need a server by design, and a bare `pytest` that happens to
+            # collect them should not fail the build over it.
+            pytest.skip(
+                f"no server at {BASE_URL}; set SERVICE_B_URL to a running "
+                f"Service B to run the contract suite",
+                allow_module_level=True,
+            )
+        if resp.status_code != 200:
+            pytest.exit(f"no OpenAPI document at {BASE_URL}/openapi.json", returncode=1)
+        doc = resp.json()
+        if "/v1/triage" not in doc.get("paths", {}):
+            pytest.exit(
+                f"{BASE_URL} is not Service B.\n"
+                f"  title: {doc.get('info', {}).get('title')!r}\n"
+                f"  paths: {sorted(doc.get('paths', {}))}\n"
+                f"Set SERVICE_B_URL to a Service B instance "
+                f"(/healthz must return exactly {{\"status\":\"ok\"}}).",
+                returncode=1,
+            )
+
+
 @pytest.fixture(scope="session")
 def spec(client: httpx.Client) -> dict:
     """The contract as the running service publishes it."""
