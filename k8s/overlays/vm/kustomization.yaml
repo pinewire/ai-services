@@ -1,0 +1,24 @@
+# Target: the team's single-node k3s on k8s-vm-1.
+#
+# That cluster was installed without Traefik and without servicelb, so there
+# is no ingress controller and no LoadBalancer implementation — an Ingress
+# would be accepted and do nothing, and type: LoadBalancer would sit Pending
+# forever. Exposure is therefore a NodePort, reached over an SSH tunnel until
+# someone adds a GCP firewall rule.
+#
+# The node has 2 vCPU and ~2.8Gi allocatable with kube-system already
+# resident, so requests are deliberately small.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+images:
+  - name: service-b
+    newName: ghcr.io/pinewire/service-b
+    newTag: 7608ba7
+
+patches:
+  - path: service-nodeport.yaml
+  - path: deployment-tuning.yaml

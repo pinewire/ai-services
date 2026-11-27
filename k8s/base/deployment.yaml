@@ -1,0 +1,121 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: service-b
+  labels:
+    app.kubernetes.io/name: service-b
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: service-b
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: service-b
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+
+      # Alembic owns the schema, and it runs here rather than in the app's
+      # lifespan so the API process starts even when Postgres is unreachable.
+      # An initContainer is safe at replicas:1; at higher replica counts this
+      # becomes a migration race and needs to move to a pre-deploy Job.
+      initContainers:
+        - name: migrate
+          image: service-b
+          imagePullPolicy: IfNotPresent
+          command: ["alembic", "upgrade", "head"]
+          envFrom:
+            - configMapRef:
+                name: service-b-config
+            - secretRef:
+                name: service-b-secrets
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+      containers:
+        - name: api
+          image: service-b
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: service-b-config
+            - secretRef:
+                name: service-b-secrets
+
+          # Liveness touches nothing: if the process answers, it is alive.
+          # Restarting a pod because its database is down turns a dependency
+          # outage into a crash loop.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          # Readiness checks Postgres and returns 503 when it is unreachable,
+          # so the pod is removed from the Service's endpoints and put back
+          # when the database recovers — without being killed.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 3
+            failureThreshold: 20
+
+          resources:
+            requests:
+              cpu: 150m
+              memory: 256Mi
+            limits:
+              # No CPU limit: throttling an async I/O-bound service adds
+              # latency without protecting anything. Memory is limited
+              # because overcommitting it kills the node, not the pod.
+              memory: 512Mi
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: tmp
+          emptyDir: {}

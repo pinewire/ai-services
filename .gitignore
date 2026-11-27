@@ -8,3 +8,6 @@ venv/
 *.egg-info/
 .ruff_cache/
 evals/rag_eval_report.json
+
+# hypothesis / schemathesis example database
+.hypothesis/

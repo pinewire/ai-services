@@ -1,0 +1,655 @@
+openapi: 3.1.0
+info:
+  title: Service B — Triage
+  summary: Classifies helpdesk tickets and drafts grounded replies.
+  version: 0.3.0
+  description: |-
+    Contract between **Service A** (ticket intake, the caller) and **Service B**
+    (triage, the provider).
+
+    This document is generated from Service B's code. The schemas come from the
+    Pydantic models that validate real requests, so they cannot drift from the
+    implementation. Do not hand-edit it — change the code and regenerate.
+
+    ## Bounded contexts
+
+    Service A owns the system of record. It must be correct and available.
+    Service B owns judgement. It is allowed to be wrong, slow, or entirely
+    unavailable, and that permission is what lets A's guarantees not depend on
+    B's. A must never fail a ticket create because of B.
+
+    A sends a projection of the ticket. No name, email or internal identifier
+    crosses the boundary — department and tenure help classification, a person's
+    name does not.
+
+    ## Idempotency, and the two caches
+
+    `request_id` is the idempotency key, generated once by A when the ticket is
+    created and stored on the outbox row, so every retry reuses it.
+
+    * **Same `request_id`, same content** → the stored verdict, with
+      `replayed: true` and `token_cost_usd: 0.0`. The judgement fields are
+      byte-identical; `received_at`, `completed_at` and `latency_ms` describe
+      *this* call. A can sum `token_cost_usd` across responses to get real
+      spend — a replay reporting the original cost would multiply it by A's
+      retry count.
+    * **Same `request_id`, different content** → `409`. Honouring the
+      idempotency guarantee here would mean confidently answering a ticket
+      nobody asked about, in a response that looks perfectly well-formed. Do
+      not retry a 409; allocate a new `request_id`.
+    * **Different `request_id`, identical content** → also a replay. B keeps a
+      second cache keyed on a hash of the ticket text, so two genuinely distinct
+      tickets with the same words get byte-identical responses, citations
+      included. This is deliberate and saves real inference cost. It reads as a
+      bug the first time you see it.
+
+    ## Error taxonomy
+
+    A's retry policy and circuit breaker branch on these. The distinction that
+    matters most is 429 versus 503.
+
+    | Status | `error`                | Retry?             | Count toward A's breaker? |
+    | ------ | ---------------------- | ------------------ | ------------------------- |
+    | 401    | —                      | No                 | No — alert instead        |
+    | 409    | `request_id_conflict`  | No, new id         | No — a bug in A           |
+    | 422    | —                      | No                 | No — a bug in A           |
+    | 429    | `at_capacity`          | Yes, `Retry-After` | **No**                    |
+    | 503    | `triage_failed`        | Yes, back off      | Yes                       |
+    | 504    | `timeout`              | Once               | Yes                       |
+
+    A 429 is B working correctly: it shed load deliberately and is healthy. A's
+    breaker opens after five consecutive failures and half-opens after 30
+    seconds, so counting load-shedding as failure lets a traffic burst trip the
+    breaker and hold triage down for the whole cooldown, long after B has
+    drained. `Retry-After` on a 429 is short (seconds) for the same reason.
+
+    B never returns 500.
+
+    ## Timeouts, and the retry interval
+
+    B enforces its own deadline (`TRIAGE_TIMEOUT_SECONDS`, 8s by default) and
+    returns 504 rather than hanging. Keep A's patient timeout *longer* than
+    that: a 504 carries `prompt_version` and a request id, a socket timeout
+    carries nothing.
+
+    The 800ms and 2500ms figures in A's and B's design pages are both right,
+    for different callers. A's synchronous attempt during ticket creation is
+    opportunistic and should fail fast — 800ms–1s — falling through to the
+    outbox. A's outbox worker has nobody waiting and should be patient — 10s.
+
+    **A's outbox retry interval must exceed B's deadline.** If A gives up at
+    800ms while B is still working, and the outbox retries before B commits, B
+    starts a second full run for the same `request_id`. Both finish, one loses
+    the race on the unique index, and A sees a failure for work that succeeded.
+    With an 8s deadline the first retry should be no sooner than ~10s.
+
+    ## What `confidence` is, and is not
+
+    `confidence` is composed from retrieval signals: the top chunk's similarity,
+    the margin to the next, and whether the vector and keyword retrievers agreed
+    on it. A value at or below 0.3 means citation validation found nothing to
+    ground an answer in.
+
+    **It measures retrieval quality, not classification correctness.** A
+    well-grounded answer in a well-covered area scores high even when the
+    category is wrong, and a correct category in a thin area scores low — a
+    correctly-classified `network.vpn` ticket measured 0.19 in testing.
+
+    So do not route on a numeric threshold. The scale is an artifact of B's
+    retrieval internals and will move when the embedder, the reranker or the
+    weights change; a threshold in A's code would be silently re-tuned by every
+    such change. Route on `status` instead:
+
+    * `ok` — B grounded its answer in the knowledge base.
+    * `ungrounded` — B ran fine and nothing supports a reply. `category` is
+      `other`, `suggested_reply` is null, `clarifying_questions` is populated.
+      This is a **correct refusal, not a failure**: send it to a human with the
+      questions. It is a 200, and A must tell it apart from a 5xx.
+    * `degraded` — B returned a partial result rather than nothing. Treat the
+      classification as provisional and do not auto-route on it.
+
+    ## Citations
+
+    `citations[].score` is a reciprocal-rank-fusion value, not a relevance
+    percentage. First place is 1/61 ≈ 0.0164. Do not render it as a percentage.
+
+    ## Authentication
+
+    Every callable endpoint requires `X-API-Key`. Service A has its own key, so
+    its traffic is distinguishable from test clients. B accepts a comma-separated
+    list, so rotation is: deploy both keys, move callers, deploy one.
+
+    The probes (`/healthz`, `/readyz`) are deliberately unauthenticated — the
+    kubelet cannot send a header.
+
+    ## Versioning
+
+    Both services deploy independently; they are never in lockstep. Every
+    response carries `model` and `prompt_version`, and A should persist them
+    alongside the ticket — without them, "did accuracy change when we changed
+    the prompt" is unanswerable because the evidence was never recorded.
+
+    A breaking change to this contract rolls out in two steps: B accepts both
+    shapes, A moves, B drops the old shape.
+  x-contract-decisions:
+  - 'request_id: UUID v4, 36 characters with hyphens. Confirmed.'
+  - 'priority: lowercase p1-p4, not P1-P4.'
+  - 'category: a closed enum — network.vpn, access.password, hardware.laptop, finance.systems, other.
+    Adding a member is a contract change. ''network'' alone is not valid.'
+  - 'citations: an array of objects {chunk_id, doc_title, score}, not an array of strings. chunk_id is
+    a UUID, not ''kb-chunk-1042''.'
+  - 'received_at / completed_at: implemented, both offset-aware UTC.'
+  - 'cached: named ''replayed'', because B has two caches and the flag covers both. See the idempotency
+    section.'
+  - 'timeout: B''s deadline is 8s and returns 504. A uses ~1s on the synchronous path and 10s in the outbox
+    worker. See the timeout section.'
+  - 'split classify/draft: agreed in principle, not yet implemented. Blocked on deciding whether /v1/draft
+    takes a request_id and reuses the persisted chunk ids, or re-retrieves from raw text.'
+paths:
+  /v1/triage:
+    post:
+      summary: Classify a ticket and draft a grounded reply
+      operationId: triage_v1_triage_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TriageRequest'
+            example:
+              request_id: 1fd016de-d411-4977-844c-4c2651adfecd
+              ticket_ref: TKT-10432
+              subject: VPN keeps dropping after 30 seconds
+              messages:
+              - author_type: customer
+                body: My VPN disconnects every 30 seconds since this morning. Error VPN-4021.
+                created_at: '2026-11-16T22:10:04.100Z'
+              requester:
+                department: Engineering
+                region: us-east
+                tenure_days: 120
+                prior_ticket_count: 2
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TriageResponse'
+              examples:
+                answered:
+                  summary: Grounded answer
+                  value:
+                    request_id: 1fd016de-d411-4977-844c-4c2651adfecd
+                    status: ok
+                    received_at: '2026-11-21T17:12:37.710529Z'
+                    completed_at: '2026-11-21T17:12:37.736797Z'
+                    category: network.vpn
+                    priority: p2
+                    confidence: 0.19
+                    suggested_reply: Thanks for reporting this. This looks like a known network.vpn issue...
+                    clarifying_questions: []
+                    citations:
+                    - chunk_id: cea73949-7027-4fd6-b59f-dc8666e95774
+                      doc_title: network
+                      score: 0.0164
+                    model: rule-based-v1
+                    prompt_version: pipeline-v1
+                    latency_ms: 26
+                    replayed: false
+                    token_cost_usd: 0.0
+                replayed:
+                  summary: Replay — identical verdict, zero cost, this call's clocks
+                  value:
+                    request_id: 1fd016de-d411-4977-844c-4c2651adfecd
+                    status: ok
+                    received_at: '2026-11-21T17:12:37.740112Z'
+                    completed_at: '2026-11-21T17:12:37.741903Z'
+                    category: network.vpn
+                    priority: p2
+                    confidence: 0.19
+                    suggested_reply: Thanks for reporting this. This looks like a known network.vpn issue...
+                    clarifying_questions: []
+                    citations:
+                    - chunk_id: cea73949-7027-4fd6-b59f-dc8666e95774
+                      doc_title: network
+                      score: 0.0164
+                    model: rule-based-v1
+                    prompt_version: pipeline-v1
+                    latency_ms: 1
+                    replayed: true
+                    token_cost_usd: 0.0
+                ungrounded:
+                  summary: Correct refusal — a 200, not a failure. Route to a human.
+                  value:
+                    request_id: 513c5354-d7f1-4d6d-8362-f8cbb608403b
+                    status: ungrounded
+                    received_at: '2026-11-21T17:12:37.744888Z'
+                    completed_at: '2026-11-21T17:12:37.747541Z'
+                    category: other
+                    priority: p3
+                    confidence: 0.3
+                    suggested_reply: null
+                    clarifying_questions:
+                    - What exactly happens when you try — any error message on screen?
+                    - When did this start, and did anything change just before?
+                    - Does it happen on every attempt or only sometimes?
+                    citations: []
+                    model: rule-based-v1
+                    prompt_version: pipeline-v1
+                    latency_ms: 2
+                    replayed: false
+                    token_cost_usd: 0.0
+        '401':
+          description: Missing or invalid API key. Do not retry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: request_id reused for different content. Do not retry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '429':
+          description: At capacity. Retry after Retry-After; not a B failure.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          headers: &id001
+            Retry-After:
+              description: Seconds to wait before retrying.
+              schema:
+                type: integer
+                minimum: 1
+        '503':
+          description: Dependency failed. Retry via the outbox.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          headers: *id001
+        '504':
+          description: B exceeded its own deadline. Retry once.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          headers: *id001
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - APIKeyHeader: []
+      x-timeout-ms: 8000
+      x-client-timeout-ms:
+        synchronous: 1000
+        outbox-worker: 10000
+  /v1/feedback:
+    post:
+      summary: Record an agent correction against a past triage run
+      operationId: feedback_v1_feedback_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FeedbackRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FeedbackResponse'
+        '401':
+          description: Missing or invalid API key.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: No triage run for that request_id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - APIKeyHeader: []
+components:
+  schemas:
+    Category:
+      type: string
+      enum:
+      - network.vpn
+      - access.password
+      - hardware.laptop
+      - finance.systems
+      - other
+      title: Category
+      description: |-
+        The closed set of categories B is allowed to return.
+
+        `other` is the deliberate escape hatch. A model with no honest option
+        will pick the nearest-looking label and report high confidence for it,
+        and a confidently wrong routing decision costs more than an explicit
+        "I don't know" that A can send to the general queue. Adding a member
+        here is a contract change: A routes on these values, so both services
+        have to agree before a new one can be returned.
+    Citation:
+      properties:
+        chunk_id:
+          type: string
+          title: Chunk Id
+        doc_title:
+          type: string
+          title: Doc Title
+        score:
+          type: number
+          maximum: 1.0
+          minimum: 0.0
+          title: Score
+      type: object
+      required:
+      - chunk_id
+      - doc_title
+      - score
+      title: Citation
+    ErrorResponse:
+      properties:
+        error:
+          type: string
+          title: Error
+        detail:
+          type: string
+          title: Detail
+        request_id:
+          anyOf:
+          - type: string
+            format: uuid
+          - type: 'null'
+          title: Request Id
+      type: object
+      required:
+      - error
+      - detail
+      title: ErrorResponse
+    FeedbackRequest:
+      properties:
+        request_id:
+          type: string
+          format: uuid
+          title: Request Id
+        verdict:
+          type: string
+          enum:
+          - correct
+          - incorrect
+          title: Verdict
+        corrected_category:
+          anyOf:
+          - $ref: '#/components/schemas/Category'
+          - type: 'null'
+        corrected_priority:
+          anyOf:
+          - $ref: '#/components/schemas/Priority'
+          - type: 'null'
+      type: object
+      required:
+      - request_id
+      - verdict
+      title: FeedbackRequest
+    FeedbackResponse:
+      properties:
+        status:
+          type: string
+          const: recorded
+          title: Status
+        run_id:
+          type: string
+          format: uuid
+          title: Run Id
+      type: object
+      required:
+      - status
+      - run_id
+      title: FeedbackResponse
+    HTTPValidationError:
+      properties:
+        detail:
+          items:
+            $ref: '#/components/schemas/ValidationError'
+          type: array
+          title: Detail
+      type: object
+      title: HTTPValidationError
+    Message:
+      properties:
+        author_type:
+          type: string
+          enum:
+          - customer
+          - agent
+          - system
+          title: Author Type
+        body:
+          type: string
+          maxLength: 20000
+          minLength: 1
+          title: Body
+        created_at:
+          type: string
+          format: date-time
+          title: Created At
+      type: object
+      required:
+      - author_type
+      - body
+      - created_at
+      title: Message
+    Priority:
+      type: string
+      enum:
+      - p1
+      - p2
+      - p3
+      - p4
+      title: Priority
+    Requester:
+      properties:
+        department:
+          type: string
+          title: Department
+        region:
+          type: string
+          title: Region
+        tenure_days:
+          type: integer
+          minimum: 0.0
+          title: Tenure Days
+        prior_ticket_count:
+          type: integer
+          minimum: 0.0
+          title: Prior Ticket Count
+      type: object
+      required:
+      - department
+      - region
+      - tenure_days
+      - prior_ticket_count
+      title: Requester
+      description: |-
+        Non-identifying context only.
+
+        Department and tenure genuinely help classification: a Finance ticket
+        during month-end close is more urgent than the same ticket in week two.
+        A person's name does not help at all, so it never crosses the boundary.
+    TriageRequest:
+      properties:
+        request_id:
+          type: string
+          format: uuid
+          title: Request Id
+        ticket_ref:
+          type: string
+          title: Ticket Ref
+        subject:
+          type: string
+          maxLength: 500
+          minLength: 1
+          title: Subject
+        messages:
+          items:
+            $ref: '#/components/schemas/Message'
+          type: array
+          maxItems: 50
+          minItems: 1
+          title: Messages
+        requester:
+          $ref: '#/components/schemas/Requester'
+        hints:
+          additionalProperties:
+            type: string
+          type: object
+          title: Hints
+      type: object
+      required:
+      - request_id
+      - ticket_ref
+      - subject
+      - messages
+      - requester
+      title: TriageRequest
+    TriageResponse:
+      properties:
+        request_id:
+          type: string
+          format: uuid
+          title: Request Id
+        status:
+          $ref: '#/components/schemas/TriageStatus'
+          default: ok
+        received_at:
+          type: string
+          format: date-time
+          title: Received At
+        completed_at:
+          type: string
+          format: date-time
+          title: Completed At
+        category:
+          $ref: '#/components/schemas/Category'
+        priority:
+          $ref: '#/components/schemas/Priority'
+        confidence:
+          type: number
+          maximum: 1.0
+          minimum: 0.0
+          title: Confidence
+        suggested_reply:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Suggested Reply
+        clarifying_questions:
+          items:
+            type: string
+          type: array
+          title: Clarifying Questions
+        citations:
+          items:
+            $ref: '#/components/schemas/Citation'
+          type: array
+          title: Citations
+        model:
+          type: string
+          title: Model
+        prompt_version:
+          type: string
+          title: Prompt Version
+        latency_ms:
+          type: integer
+          title: Latency Ms
+        replayed:
+          type: boolean
+          title: Replayed
+          default: false
+        token_cost_usd:
+          type: number
+          title: Token Cost Usd
+      type: object
+      required:
+      - request_id
+      - received_at
+      - completed_at
+      - category
+      - priority
+      - confidence
+      - model
+      - prompt_version
+      - latency_ms
+      - token_cost_usd
+      title: TriageResponse
+    TriageStatus:
+      type: string
+      enum:
+      - ok
+      - ungrounded
+      - degraded
+      title: TriageStatus
+      description: |-
+        Why the response looks the way it does.
+
+        A routes on this before it looks at anything else:
+
+        ok          B ran the full pipeline and grounded its answer in the KB.
+        ungrounded  B ran fine but nothing in the KB supports a reply. Category
+                    is `other`, `suggested_reply` is null, and
+                    `clarifying_questions` is populated. Route to a human — this
+                    is a correct refusal, not a failure.
+        degraded    B ran out of time or a dependency failed, and this is the
+                    partial result rather than nothing. Treat the classification
+                    as provisional and do not auto-route on it.
+    ValidationError:
+      properties:
+        loc:
+          items:
+            anyOf:
+            - type: string
+            - type: integer
+          type: array
+          title: Location
+        msg:
+          type: string
+          title: Message
+        type:
+          type: string
+          title: Error Type
+      type: object
+      required:
+      - loc
+      - msg
+      - type
+      title: ValidationError
+  securitySchemes:
+    APIKeyHeader:
+      type: apiKey
+      in: header
+      name: X-API-Key
+servers:
+- url: http://service-b.service-b.svc.cluster.local
+  description: In-cluster (k3s, namespace service-b)
+- url: http://localhost:8000
+  description: Local development
+

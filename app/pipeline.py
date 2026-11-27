@@ -5,12 +5,14 @@ confidence, and persistence. See README for the full design rationale.
 
 import hashlib
 import time
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.confidence import compute_confidence
 from app.embeddings import get_embedding_client
+from app.errors import RequestIdConflict
 from app.llm import get_triage_model
 from app.metrics import (
     llm_cost_usd_total,
@@ -22,7 +24,13 @@ from app.metrics import (
 )
 from app.models import TriageRun
 from app.retrieval import retrieve
-from app.schemas import Citation, TriageRequest, TriageResponse
+from app.schemas import (
+    Category,
+    Citation,
+    TriageRequest,
+    TriageResponse,
+    TriageStatus,
+)
 
 PROMPT_VERSION = "pipeline-v1"
 
@@ -62,28 +70,62 @@ async def _persist_run(
     await session.commit()
 
 
+def _as_replay(stored_output: dict, request_id, received_at: datetime) -> TriageResponse:
+    """Re-serve a stored response without charging for it twice.
+
+    `token_cost_usd` is zeroed and `replayed` set, because no model call was
+    made on this request. Leaving the original cost in place meant every
+    retry A made inflated the spend A computes from these responses, and
+    every near-duplicate hit inflated it again — the field exists precisely
+    so A can sum it, so it has to describe this call and not another one.
+
+    `latency_ms`, `received_at` and `completed_at` are likewise this call's,
+    so A's latency numbers describe what A actually waited for rather than
+    the original run. The judgement — category, priority, confidence,
+    citations — is the stored one, unchanged. That split is the whole point:
+    identical verdict, honest accounting.
+    """
+    stored = TriageResponse.model_validate({**stored_output, "request_id": request_id})
+    return stored.replay_as(request_id, received_at, datetime.now(UTC))
+
+
 async def run_triage(session: AsyncSession, payload: TriageRequest) -> TriageResponse:
     started = time.perf_counter()
+    # Wall clock for the contract's timestamps; perf_counter for latency,
+    # because it is monotonic and an NTP step mid-request would otherwise
+    # produce a negative duration.
+    received_at = datetime.now(UTC)
     model = get_triage_model()
-
-    # 1. Idempotency check — A's synchronous attempt and its outbox worker
-    # can both fire for the same ticket; the second one gets the cached run.
-    existing = await session.scalar(select(TriageRun).where(TriageRun.request_id == payload.request_id))
-    if existing is not None and existing.model == model.model_name:
-        triage_cache_hits_total.labels(cache="request_id").inc()
-        return TriageResponse.model_validate({**existing.output, "request_id": existing.request_id})
 
     ticket_text = _ticket_text(payload)
     input_hash = _input_hash(payload)
 
+    # 1. Idempotency check — A's synchronous attempt and its outbox worker
+    # can both fire for the same ticket; the second one gets the cached run.
+    existing = await session.scalar(select(TriageRun).where(TriageRun.request_id == payload.request_id))
+    if existing is not None:
+        # Same key, different question. B's guarantee is "same request_id,
+        # same answer", so honouring it here would mean confidently
+        # answering a ticket nobody asked about, in a response that looks
+        # perfectly well-formed. Refuse instead and let A see the bug.
+        # `is not None` guards rows written before input_hash was recorded.
+        if existing.input_hash is not None and existing.input_hash != input_hash:
+            raise RequestIdConflict(str(payload.request_id))
+        if existing.model == model.model_name:
+            triage_cache_hits_total.labels(cache="request_id").inc()
+            return _as_replay(existing.output, payload.request_id, received_at)
+
     # Near-duplicate cache: same content, different request_id — skip the
-    # whole pipeline rather than just the model call.
+    # whole pipeline rather than just the model call. Two distinct tickets
+    # with identical text therefore get byte-identical responses, citations
+    # included. That is intentional, and the contract says so, because
+    # otherwise it reads as a bug.
     cached = await session.scalar(
         select(TriageRun).where(TriageRun.input_hash == input_hash).order_by(TriageRun.created_at.desc())
     )
     if cached is not None and cached.model == model.model_name:
         triage_cache_hits_total.labels(cache="input_hash").inc()
-        response = TriageResponse.model_validate({**cached.output, "request_id": payload.request_id})
+        response = _as_replay(cached.output, payload.request_id, received_at)
         await _persist_run(session, payload, input_hash, cached.retrieved_chunk_ids, response)
         return response
 
@@ -110,9 +152,18 @@ async def run_triage(session: AsyncSession, payload: TriageRequest) -> TriageRes
     )
 
     # 9. Compose confidence (capped hard if no citation survived), respond.
+    #
+    # `ungrounded` is not a failure: B ran the whole pipeline and found that
+    # the KB does not support an answer. A needs to tell that apart from a
+    # 5xx, because the right handling is "route to a human with the
+    # clarifying questions", not "retry later and hope".
     confidence = compute_confidence(chunks, len(surviving))
+    triage_status = TriageStatus.ok if surviving else TriageStatus.ungrounded
     response = TriageResponse(
         request_id=payload.request_id,
+        status=triage_status,
+        received_at=received_at,
+        completed_at=datetime.now(UTC),
         category=output.category,
         priority=output.priority,
         confidence=confidence,
@@ -126,7 +177,7 @@ async def run_triage(session: AsyncSession, payload: TriageRequest) -> TriageRes
     )
 
     triage_confidence.observe(response.confidence)
-    if response.category == "other" and not response.suggested_reply:
+    if response.category == Category.other and not response.suggested_reply:
         triage_refusals_total.inc()
     if model_result.prompt_tokens:
         llm_tokens_total.labels(type="prompt").inc(model_result.prompt_tokens)
